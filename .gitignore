@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+build/
+*.spec
+avatar_b64.txt
+embed_avatar.py
