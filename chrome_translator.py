@@ -413,8 +413,7 @@ class Translator:
                     )
                 except Exception as e:
                     self._emit("error", f"Gửi audio: {e}")
-                    self._stop.set()
-                    break
+                    raise  # let TaskGroup catch → reconnect
 
     async def receive_audio(self):
         while not self._stop.is_set():
@@ -438,12 +437,13 @@ class Translator:
                             if inline and inline.data:
                                 self.translated_queue.put_nowait(inline.data)
                 if not self._stop.is_set():
-                    self._emit("error", "Gemini đã ngắt kết nối.")
-                    self._stop.set()
+                    self._emit("info", "Phiên Gemini kết thúc.")
+                    raise ConnectionError("session ended")  # → reconnect
+            except ConnectionError:
+                raise  # propagate to TaskGroup
             except Exception as e:
                 self._emit("error", f"Nhận audio: {e}")
-                self._stop.set()
-                break
+                raise  # → reconnect
 
     async def play_output(self):
         """CHỈ phát âm thanh đã dịch → không còn vọng do phát lại âm gốc."""
@@ -502,29 +502,54 @@ class Translator:
 
     async def run(self):
         config = make_config(self.target_lang)
-        self._emit("status", "Đang kết nối Gemini…")
-        try:
-            async with client.aio.live.connect(model=self.model, config=config) as session:
-                self.session = session
-                self._emit("ok", "Đã kết nối. Đang dịch…")
-                try:
-                    async with asyncio.TaskGroup() as tg:
-                        tg.create_task(self.start_capture())
-                        tg.create_task(self.send_audio())
-                        tg.create_task(self.receive_audio())
-                        tg.create_task(self.play_output())
-                        tg.create_task(self._watch_stop())
-                except* _StopSignal:
-                    pass
-                except* Exception as eg:
-                    for e in eg.exceptions:
-                        self._emit("error", f"{type(e).__name__}: {e}")
-        except Exception as e:
-            self._emit("error", f"Kết nối thất bại: {e}")
-        finally:
-            # Khôi phục âm lượng app nguồn về mức ban đầu
-            self._vol_ctl.restore()
-            self._emit("stopped", "")
+        # ponytail: auto-reconnect — Gemini Live sessions expire after ~15min
+        MAX_RETRIES = 5
+        retry = 0
+        while not self._stop.is_set():
+            self._emit("status", "Đang kết nối Gemini…")
+            try:
+                async with client.aio.live.connect(model=self.model, config=config) as session:
+                    self.session = session
+                    retry = 0  # reset on successful connect
+                    self._emit("ok", "Đã kết nối. Đang dịch…")
+                    _user_stopped = False
+                    try:
+                        async with asyncio.TaskGroup() as tg:
+                            tg.create_task(self.start_capture())
+                            tg.create_task(self.send_audio())
+                            tg.create_task(self.receive_audio())
+                            tg.create_task(self.play_output())
+                            tg.create_task(self._watch_stop())
+                    except* _StopSignal:
+                        _user_stopped = True
+                    except* Exception as eg:
+                        for e in eg.exceptions:
+                            self._emit("error", f"{type(e).__name__}: {e}")
+                        # fall through to reconnect
+                    if _user_stopped:
+                        break
+            except Exception as e:
+                if self._stop.is_set():
+                    break
+                retry += 1
+                if retry > MAX_RETRIES:
+                    self._emit("error", f"Không thể kết nối sau {MAX_RETRIES} lần: {e}")
+                    break
+                wait = min(2 ** retry, 16)
+                self._emit("info", f"Mất kết nối, tự động kết nối lại sau {wait}s… ({retry}/{MAX_RETRIES})")
+                await asyncio.sleep(wait)
+                continue
+            # Session ended normally (GoAway) — reconnect immediately
+            if not self._stop.is_set():
+                self.session = None
+                self._emit("info", "Phiên hết hạn, đang kết nối lại…")
+                await asyncio.sleep(0.5)
+                continue
+            break
+        # Khôi phục âm lượng app nguồn về mức ban đầu
+        self._vol_ctl.restore()
+        self._emit("stopped", "")
+
 
 
 # ────────────────────────────────────────────────────────────────
