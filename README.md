@@ -17,7 +17,7 @@
 
 ## 📥 Tải về
 
-👉 Tải file **[AudioTranslator.exe](dist/AudioTranslator.exe)** trong thư mục `dist/` — chạy luôn, không cần cài Python.
+👉 Tải file **[AudioTranslator.exe](https://github.com/namdx999/audio-translator/releases/latest)** từ trang Releases — chạy luôn, không cần cài Python.
 
 ## 🚀 Hướng dẫn sử dụng
 

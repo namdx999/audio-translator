@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 build/
+dist/
 *.spec
 avatar_b64.txt
 embed_avatar.py
+test_translator.py
