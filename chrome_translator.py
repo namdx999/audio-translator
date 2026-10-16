@@ -4,19 +4,28 @@ Live Audio Translator
 Dịch âm thanh real-time từ bất kỳ ứng dụng nào (trình duyệt, media player...)
 sang tiếng Việt qua Gemini Live API.
 
-Kiến trúc chống vọng (v2):
-  - App CHỈ phát âm thanh đã dịch ra loa.
-  - Âm thanh gốc vẫn phát tự nhiên từ ứng dụng nguồn (không phát lại → không vọng).
-  - Thanh "âm lượng gốc" điều khiển trực tiếp volume của app nguồn qua Windows.
+Kiến trúc chống lặp loa 3 tầng (v4 — mọi phiên bản Windows):
+  - Tầng 1 (Win 10 2004+ Build ≥ 19041 & Win 11): Gọi trực tiếp WASAPI
+    ActivateAudioInterfaceAsync (VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK) chế độ
+    INCLUDE_TARGET_PROCESS_TREE theo Root PID của ứng dụng nguồn (vượt qua giới hạn
+    build 20438 sai của proctap, bật AUTOCONVERTPCM cho mọi tần số mẫu).
+  - Tầng 2 (Fallback cấp OS Mixer): Dùng chế độ EXCLUDE_TARGET_PROCESS_TREE với
+    chính Root PID của AudioTranslator → Windows tự loại bỏ 100% giọng dịch khỏi
+    luồng thu.
+  - Tầng 3 (Windows đời cũ < Build 19041): Khử vọng số (EchoCanceller: GCC-PHAT +
+    bộ lọc FIR Wiener-Hopf + bộ triệt phần dư phi tuyến NLP & khóa chống bypass).
 
 Đóng gói .exe (chạy trên PC khác, không cần Python):
     pip install pyinstaller google-genai numpy psutil pyaudio pycaw comtypes proctap
     pyinstaller --noconfirm --onefile --windowed --name "AudioTranslator" ^
-        --collect-all proctap --hidden-import comtypes --hidden-import pycaw app.py
+        --collect-all proctap --hidden-import comtypes --hidden-import pycaw chrome_translator.py
 """
 
 import os
 import sys
+import time
+import ctypes
+from ctypes import wintypes
 import asyncio
 import threading
 import queue as thread_queue
@@ -170,6 +179,115 @@ def _pretty_app_name(exe_name: str) -> str:
     return base.capitalize()
 
 
+def _get_process_label(name: str, cmdline: list[str] | None = None) -> str:
+    """Tương thích kiểm thử: nhãn hiển thị cho tiến trình trình duyệt/ứng dụng."""
+    nl = (name or "").lower()
+    cmdline = cmdline or []
+    if nl in ("chrome.exe", "msedge.exe", "brave.exe"):
+        browser = "Chrome" if "chrome" in nl else ("Edge" if "msedge" in nl else "Brave")
+        profile = "default"
+        for arg in cmdline:
+            if arg.startswith("--profile-directory="):
+                profile = arg.split("=", 1)[1].strip('"').strip("'")
+                break
+        return f"{browser} ({profile})"
+    return name.rsplit(".", 1)[0] if "." in name else name
+
+
+def _is_child_process(name: str, cmdline: list[str] | None = None) -> bool:
+    """Tương thích kiểm thử: kiểm tra tiến trình con của Chromium."""
+    nl = (name or "").lower()
+    cmdline = cmdline or []
+    if nl in ("chrome.exe", "msedge.exe", "brave.exe", "vivaldi.exe", "opera.exe"):
+        return any(arg.startswith("--type=") for arg in cmdline)
+    return False
+
+
+def _own_pids() -> set[int]:
+    """PID của chính app (+ tiến trình cha/con bootloader khi đóng gói PyInstaller onefile)."""
+    pids = {os.getpid()}
+    try:
+        me = psutil.Process()
+        my_name = me.name().lower()
+        parent = me.parent()
+        while parent and parent.name().lower() == my_name:
+            pids.add(parent.pid)
+            parent = parent.parent()
+        for child in me.children(recursive=True):
+            pids.add(child.pid)
+    except Exception:
+        pass
+    return pids
+
+
+def _own_root_pid() -> int:
+    """Root PID của chính AudioTranslator (dùng cho EXCLUDE_TARGET_PROCESS_TREE)."""
+    pid = os.getpid()
+    try:
+        me = psutil.Process(pid)
+        my_name = me.name().lower()
+        cur = me
+        visited = {pid}
+        while True:
+            parent = cur.parent()
+            if not parent or parent.pid in visited or parent.name().lower() != my_name:
+                break
+            visited.add(parent.pid)
+            cur = parent
+        return cur.pid
+    except Exception:
+        return pid
+
+
+def _root_process_pid(pid: int) -> int:
+    """Tìm tiến trình gốc cùng tên (vd: từ chrome.exe --type=utility lên chrome.exe gốc)
+    để INCLUDE_TARGET_PROCESS_TREE bao phủ toàn bộ cây tiến trình của ứng dụng."""
+    if not pid or pid <= 0:
+        return pid
+    own = _own_pids()
+    try:
+        cur = psutil.Process(pid)
+        base_name = (cur.name() or "").lower()
+        visited = {pid}
+        while True:
+            parent = cur.parent()
+            if (not parent or parent.pid in visited or parent.pid in own
+                    or (parent.name() or "").lower() != base_name):
+                break
+            visited.add(parent.pid)
+            cur = parent
+        return cur.pid
+    except Exception:
+        return pid
+
+
+def _process_family_pids(pid: int) -> set[int]:
+    """Tập hợp mọi PID thuộc cùng cây ứng dụng (hoặc cùng tên thực thi) với pid."""
+    if not pid or pid <= 0:
+        return set()
+    own = _own_pids()
+    family = {pid}
+    root_pid = _root_process_pid(pid)
+    family.add(root_pid)
+    try:
+        root_proc = psutil.Process(root_pid)
+        target_name = (root_proc.name() or "").lower()
+        for child in root_proc.children(recursive=True):
+            if child.pid not in own:
+                family.add(child.pid)
+        if target_name:
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    p = proc.info["pid"]
+                    if p not in own and (proc.info["name"] or "").lower() == target_name:
+                        family.add(p)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+    except Exception:
+        pass
+    return family - own
+
+
 def _get_active_audio_pids() -> dict[int, bool] | None:
     """Trả {pid: is_playing} theo audio session của Windows. None nếu không có pycaw."""
     try:
@@ -194,14 +312,17 @@ def _get_active_audio_pids() -> dict[int, bool] | None:
 
 
 def list_audio_sources() -> list[tuple[int, str, bool]]:
-    """Trả (pid, app_name, is_playing). Gộp trùng tên, app đang phát lên đầu."""
+    """Trả (root_pid, app_name, is_playing). Gộp trùng tên, app đang phát lên đầu."""
     known = set(_APP_NAMES.keys())
     active_pids = _get_active_audio_pids()
+    own_pids = _own_pids()
 
     raw: list[tuple[int, str, bool]] = []
     for proc in psutil.process_iter(["pid", "name"]):
         try:
             pid = proc.info["pid"]
+            if pid in own_pids:
+                continue  # không cho chọn chính app này (sẽ tự dịch giọng dịch của mình)
             name = (proc.info["name"] or "").lower()
             if active_pids is not None:
                 if pid not in active_pids:
@@ -211,7 +332,10 @@ def list_audio_sources() -> list[tuple[int, str, bool]]:
                 if name not in known:
                     continue
                 is_playing = False
-            raw.append((pid, _pretty_app_name(name), is_playing))
+            root_pid = _root_process_pid(pid)
+            if root_pid in own_pids:
+                continue
+            raw.append((root_pid, _pretty_app_name(name), is_playing))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
@@ -226,8 +350,48 @@ def list_audio_sources() -> list[tuple[int, str, bool]]:
     return results
 
 
+def list_output_devices() -> list[tuple[int, str]]:
+    """Thiết bị phát (index PyAudio, tên) thuộc host API mặc định."""
+    pa = pyaudio.PyAudio()
+    try:
+        host = pa.get_default_host_api_info()["index"]
+        out: list[tuple[int, str]] = []
+        seen: set[str] = set()
+        for i in range(pa.get_device_count()):
+            try:
+                d = pa.get_device_info_by_index(i)
+            except Exception:
+                continue
+            if d.get("hostApi") != host or int(d.get("maxOutputChannels", 0)) < 1:
+                continue
+            name = str(d.get("name", f"Device {i}"))
+            if "sound mapper" in name.lower() or name in seen:
+                continue
+            seen.add(name)
+            out.append((i, name))
+        return out
+    except Exception:
+        return []
+    finally:
+        pa.terminate()
+
+
+def is_default_output(index: int | None) -> bool:
+    """True nếu index là loa mặc định (chính là loa mà chế độ ghi toàn hệ thống đang ghi)."""
+    if index is None:
+        return True
+    pa = pyaudio.PyAudio()
+    try:
+        return int(pa.get_default_output_device_info()["index"]) == int(index)
+    except Exception:
+        return True
+    finally:
+        pa.terminate()
+
+
 class AppVolumeController:
-    """Điều khiển âm lượng của tất cả session thuộc 1 PID (qua pycaw).
+    """Điều khiển âm lượng của tất cả audio session thuộc cây tiến trình đích (qua pycaw).
+    Hỗ trợ cả trình duyệt đa tiến trình (Chrome/Edge phát âm ở tiến trình con utility).
     Nhớ mức ban đầu để khôi phục khi kết thúc."""
 
     def __init__(self, pid: int):
@@ -242,9 +406,12 @@ class AppVolumeController:
 
     def _iter_volume_interfaces(self):
         from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
+        target_pids = _process_family_pids(self.pid)
+        if not target_pids:
+            return
         for session in AudioUtilities.GetAllSessions():
             try:
-                if session.ProcessId != self.pid:
+                if session.ProcessId not in target_pids:
                     continue
                 vol = session._ctl.QueryInterface(ISimpleAudioVolume)
                 yield vol
@@ -293,6 +460,836 @@ def resample_mono(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarr
     ).astype(np.float32)
 
 
+class StreamResampler:
+    """Resample tuyến tính CÓ TRẠNG THÁI giữa các chunk.
+    Khác resample_mono: không làm rơi mẫu / lệch nhịp ở biên chunk — bắt buộc
+    để tín hiệu tham chiếu và bản ghi luôn khớp mẫu-với-mẫu khi khử vọng."""
+
+    def __init__(self, src_rate: int, dst_rate: int):
+        self.step = src_rate / dst_rate
+        self.pos = 0.0
+        self.tail = np.zeros(0, dtype=np.float32)
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32)
+        if self.step == 1.0 or len(x) == 0:
+            return x
+        buf = np.concatenate([self.tail, x]) if len(self.tail) else x
+        last = len(buf) - 1
+        if last < self.pos:
+            self.tail = buf
+            return np.zeros(0, dtype=np.float32)
+        n = int((last - self.pos) // self.step) + 1
+        idx = self.pos + np.arange(n) * self.step
+        out = np.interp(idx, np.arange(len(buf)), buf).astype(np.float32)
+        nxt = self.pos + n * self.step
+        keep = min(int(nxt), last)
+        self.tail = buf[keep:]
+        self.pos = nxt - keep
+        return out
+
+
+class SincResampler:
+    """Resample băng thông giới hạn (windowed-sinc) CÓ TRẠNG THÁI.
+    Dùng cho tín hiệu tham chiếu: mô phỏng bộ SRC chất lượng cao của Windows
+    (24 kHz → tần số mix của loa) để tham chiếu khớp với vọng thật trong bản ghi."""
+
+    def __init__(self, src_rate: int, dst_rate: int, half_taps: int = 16):
+        self.step = src_rate / dst_rate
+        self.half = half_taps
+        self.cut = min(1.0, dst_rate / src_rate)
+        self.buf = np.zeros(half_taps, dtype=np.float32)
+        self.pos = float(half_taps)
+        self._offs = np.arange(-half_taps + 1, half_taps + 1)
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32)
+        if len(x) == 0:
+            return x
+        buf = np.concatenate([self.buf, x])
+        maxpos = len(buf) - 1 - self.half
+        if self.pos > maxpos:
+            self.buf = buf
+            return np.zeros(0, dtype=np.float32)
+        n = int((maxpos - self.pos) // self.step) + 1
+        t = self.pos + np.arange(n) * self.step
+        base = np.floor(t).astype(np.int64)
+        idx = base[:, None] + self._offs[None, :]
+        d = t[:, None] - idx
+        w = self.cut * np.sinc(self.cut * d) * (0.5 + 0.5 * np.cos(np.pi * d / self.half))
+        out = (buf[idx] * w).sum(axis=1).astype(np.float32)
+        nxt = self.pos + n * self.step
+        drop = max(0, int(np.floor(nxt)) - self.half + 1)
+        self.buf = buf[drop:]
+        self.pos = nxt - drop
+        return out
+
+
+class RefResampler:
+    """Đường tham chiếu = giống hệt đường vọng thật:
+    24 kHz → (sinc, như Windows) → tần số mix → (StreamResampler, như nhánh ghi) → 16 kHz."""
+
+    def __init__(self, play_rate: int, mix_rate: int, send_rate: int):
+        self.up = SincResampler(play_rate, mix_rate) if mix_rate != play_rate else None
+        self.down = StreamResampler(mix_rate, send_rate)
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        if self.up is not None:
+            x = self.up.process(x)
+        return self.down.process(x)
+
+
+# ────────────────────────────────────────────────────────────────
+# Khử vọng số (Tầng 3) — chỉ dùng trên Windows cổ (< Build 19041)
+# khi OS không hỗ trợ VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK
+# ────────────────────────────────────────────────────────────────
+class EchoCanceller:
+    """Bản ghi toàn hệ thống = âm gốc + giọng dịch do chính app phát ra.
+    Ta biết CHÍNH XÁC tín hiệu đã phát (tham chiếu) → ước lượng độ trễ bằng
+    GCC-PHAT, ước lượng đường vọng tuyến tính (FIR Wiener-Hopf) để trừ đi,
+    kết hợp bộ triệt phần dư phi tuyến (NLP post-filter) và khóa half-duplex
+    khi chưa đồng bộ độ trễ (tuyệt đối không bypass khi đang phát giọng dịch).
+    Toàn bộ chạy ở 16 kHz mono. Thread-safe."""
+
+    FS = SEND_SAMPLE_RATE
+    N = 256                 # khối xử lý (16 ms)
+    TAPS = 128              # độ dài FIR đường vọng (8 ms)
+    PRE = 32                # tap trước độ trễ ước lượng (đáp ứng bộ lọc SRC)
+    MEMORY_S = 3.0          # hằng số thời gian trọng số mũ (theo thời gian có giọng dịch)
+    SOLVE_EVERY = 4         # giải lại hệ phương trình mỗi 4 khối
+    RING_S = 12
+    EST_WIN_S = 1.5
+    EST_EVERY_S = 0.5
+    LAG_MIN_S, LAG_MAX_S = -0.8, 2.0
+    MIN_CONF = 5.5
+    REF_ACTIVE_RMS = 1.5e-3
+    RECONVERGE_S = 0.6
+    HANGOVER_S = 0.15       # giữ cổng NLP 150ms sau khi loa phát xong câu dịch
+
+    def __init__(self, on_event=None):
+        self._lock = threading.Lock()
+        size = int(self.FS * self.RING_S)
+        self._ref = np.zeros(size, dtype=np.float32)
+        self._cap = np.zeros(size, dtype=np.float32)
+        self._ref_n = 0
+        self._cap_n = 0
+        self._ref_origin: float | None = None
+        self._cap_origin: float | None = None
+        self._pending = np.zeros(0, dtype=np.float32)
+        self._next_est = int(self.FS * 0.75)
+        self.lag: int | None = None      # cap_index = ref_index + lag
+        self._cand: int | None = None
+        self._mute_until = 0
+        self._last_active_m = -10**9
+        self.bypass = False
+        self._on_event = on_event
+        self._reset_filter()
+
+    def _event(self, text: str):
+        if self._on_event:
+            try:
+                self._on_event(text)
+            except Exception:
+                pass
+
+    def _reset_filter(self):
+        L = self.TAPS
+        self._h = np.zeros(L, dtype=np.float64)          # FIR đường vọng
+        self._R = np.zeros((L, L), dtype=np.float64)     # tự tương quan tham chiếu
+        self._p = np.zeros(L, dtype=np.float64)          # tương quan chéo ref↔bản ghi
+        self._blocks = 0
+        self._lam = float(np.exp(-self.N / (self.FS * self.MEMORY_S)))
+        self._ey = 0.0             # tương quan phần dư ↔ ước lượng vọng (phát hiện đường vọng đổi)
+        self._yy = 0.0
+        self._last_forget = 0
+
+    @staticmethod
+    def _ring_write(buf: np.ndarray, count: int, x: np.ndarray):
+        size, n = len(buf), len(x)
+        if n == 0:
+            return
+        if n > size:
+            count += n - size
+            x = x[-size:]
+            n = size
+        i = count % size
+        first = min(n, size - i)
+        buf[i:i + first] = x[:first]
+        if first < n:
+            buf[:n - first] = x[first:]
+
+    @staticmethod
+    def _ring_read(buf: np.ndarray, count: int, start: int, length: int):
+        size = len(buf)
+        if start < 0 or start < count - size or start + length > count:
+            return None
+        i = start % size
+        first = min(length, size - i)
+        if first == length:
+            return buf[i:i + length].copy()
+        return np.concatenate([buf[i:], buf[:length - first]])
+
+    # ── Tham chiếu: đúng những mẫu vừa ghi ra loa (16 kHz) ──
+    def push_ref(self, x: np.ndarray, t: float):
+        if len(x) == 0:
+            return
+        with self._lock:
+            self._ring_write(self._ref, self._ref_n, x)
+            self._ref_n += len(x)
+            o = t - self._ref_n / self.FS
+            if self._ref_origin is None or o < self._ref_origin:
+                self._ref_origin = o
+
+    # ── Bản ghi: trả về tín hiệu đã khử vọng (trễ tối đa 1 khối) ──
+    def process(self, y: np.ndarray, t: float) -> np.ndarray:
+        if len(y) == 0:
+            return y
+        with self._lock:
+            self._ring_write(self._cap, self._cap_n, y)
+            self._cap_n += len(y)
+            o = t - self._cap_n / self.FS
+            if self._cap_origin is None or o < self._cap_origin:
+                self._cap_origin = o
+            if self._cap_n >= self._next_est:
+                step_s = 0.25 if self.lag is None else self.EST_EVERY_S
+                self._next_est = self._cap_n + int(self.FS * step_s)
+                try:
+                    self._estimate()
+                except Exception:
+                    pass
+
+            self._pending = np.concatenate([self._pending, y])
+            N = self.N
+            nblk = len(self._pending) // N
+            if nblk == 0:
+                return np.zeros(0, dtype=np.float32)
+            m = self._cap_n - len(self._pending)
+            out = np.empty(nblk * N, dtype=np.float32)
+            for b in range(nblk):
+                out[b * N:(b + 1) * N] = self._cancel(
+                    self._pending[b * N:(b + 1) * N], m + b * N)
+            self._pending = self._pending[nblk * N:]
+            return out
+
+    def _ref_active_recent(self, window_s: float = 0.35) -> bool:
+        L = min(self._ref_n, int(self.FS * window_s))
+        if L <= 0:
+            return False
+        x = self._ring_read(self._ref, self._ref_n, self._ref_n - L, L)
+        return x is not None and float(np.sqrt(np.mean(x * x))) > self.REF_ACTIVE_RMS
+
+    def _cancel(self, y: np.ndarray, m: int) -> np.ndarray:
+        N = self.N
+        if self.bypass:
+            return y
+        if self.lag is None:
+            # Chưa khoá được độ trễ mà giọng dịch đang phát → luôn khoá cổng thu
+            # (TUYỆT ĐỐI không bật bypass để tránh lọt tiếng dịch gây lặp vô tận).
+            if self._ref_active_recent(0.35):
+                return np.zeros(N, dtype=np.float32)
+            return y
+
+        L = self.TAPS
+        s = m - self.lag + self.PRE
+        x = self._ring_read(self._ref, self._ref_n, s - (L - 1), N + L - 1)
+        if x is None:
+            if self._ref_active_recent(0.25):
+                return np.zeros(N, dtype=np.float32)
+            return y
+        xm = np.lib.stride_tricks.sliding_window_view(x, L)[:, ::-1]  # xm[i,k] = ref[s+i-k]
+        yhat = xm @ self._h
+        e = y - yhat
+        xn = x[L - 1:]
+        px = float(np.dot(xn, xn)) / N
+        active_thresh = self.REF_ACTIVE_RMS ** 2 * 0.25
+        if px > active_thresh:
+            self._last_active_m = m + N
+            # Cập nhật thống kê Wiener-Hopf (chỉ khi có giọng dịch)
+            self._R *= self._lam
+            self._R += xm.T @ xm
+            self._p *= self._lam
+            self._p += xm.T @ y
+            self._blocks += 1
+            # Đường vọng đổi (vd đổi âm lượng app trong Volume Mixer): phần dư còn
+            # tương quan với ước lượng vọng → quên nhanh thống kê cũ để ước lượng lại.
+            self._ey = 0.95 * self._ey + 0.05 * float(np.dot(e, yhat))
+            self._yy = 0.95 * self._yy + 0.05 * float(np.dot(yhat, yhat))
+            if (self._blocks - self._last_forget > 60 and self._yy > 1e-6
+                    and abs(self._ey) > 0.2 * self._yy):
+                self._R *= 0.05
+                self._p *= 0.05
+                self._last_forget = self._blocks
+                self._ey = 0.0
+            if self._blocks % self.SOLVE_EVERY == 0:
+                d = 1e-4 * float(np.trace(self._R)) / L + 1e-9
+                try:
+                    self._h = np.linalg.solve(self._R + d * np.eye(L), self._p)
+                except np.linalg.LinAlgError:
+                    pass
+
+        if m < self._mute_until and px > active_thresh:
+            return np.zeros(N, dtype=np.float32)  # bộ lọc đang hội tụ
+
+        # Bộ triệt phần dư phi tuyến (NLP / Wiener post-filter):
+        # Khi giọng dịch đang phát (hoặc trong khoảng ngân hangover), triệt tiêu
+        # phần vọng dư phi tuyến do Windows Audio Limiter / Enhancements gây ra.
+        in_hangover = (m <= self._last_active_m + int(self.HANGOVER_S * self.FS))
+        if px > active_thresh * 0.4 or in_hangover:
+            py_hat = float(np.dot(yhat, yhat)) / N
+            pe = float(np.dot(e, e)) / N
+            echo_floor = 0.25 * py_hat + 0.05 * px
+            if pe <= echo_floor:
+                return np.zeros(N, dtype=np.float32)
+            gain = max(0.0, (pe - echo_floor) / (pe + 1e-12))
+            e = e * gain
+
+        return e.astype(np.float32)
+
+    def _estimate(self):
+        """Ước lượng độ trễ loa→bản ghi bằng GCC-PHAT."""
+        if self._ref_origin is None or self._cap_origin is None:
+            return
+        FS = self.FS
+        W = min(int(FS * self.EST_WIN_S), self._cap_n)
+        if W < int(FS * 0.4):
+            return
+        m1 = self._cap_n
+        m0 = m1 - W
+        y = self._ring_read(self._cap, self._cap_n, m0, W)
+        if y is None:
+            return
+        A0 = (self._ref_origin - self._cap_origin) * FS
+        lo = int(np.floor(A0 + self.LAG_MIN_S * FS))
+        hi = int(np.ceil(A0 + self.LAG_MAX_S * FS))
+        r0 = max(m0 - hi, self._ref_n - len(self._ref), 0)
+        r1 = min(m1 - lo, self._ref_n)
+        if r1 - r0 < W + 64:
+            return
+        x = self._ring_read(self._ref, self._ref_n, r0, r1 - r0)
+        if x is None or float(np.sqrt(np.mean(x * x))) < self.REF_ACTIVE_RMS:
+            return
+        L = len(x)
+        nfft = 1 << int(np.ceil(np.log2(L + W)))
+        C = np.fft.rfft(x, nfft) * np.conj(np.fft.rfft(y, nfft))
+        C /= np.abs(C) + 1e-12
+        c = np.fft.irfft(C, nfft)[:L - W + 1]
+        j = int(np.argmax(c))
+        mask = np.ones(len(c), dtype=bool)
+        mask[max(0, j - 32):j + 33] = False
+        if mask.sum() < 50:
+            return
+        conf = float(c[j] / (np.std(c[mask]) + 1e-12))
+        if conf < self.MIN_CONF:
+            return
+        A = m0 - r0 - j
+
+        if self.lag is None or self.bypass:
+            self._lock_lag(A)
+            self._event(f"Khử vọng: đã đồng bộ (trễ ≈ {A / FS * 1000:.0f} ms so với mốc).")
+        elif abs(A - self.lag) > 8:
+            # cần 2 lần đo khớp nhau mới đổi → tránh nhảy do đỉnh giả
+            if self._cand is not None and abs(A - self._cand) <= 8:
+                self._lock_lag(A)
+                self._event("Khử vọng: độ trễ thay đổi, đồng bộ lại.")
+            else:
+                self._cand = A
+        else:
+            self._cand = None
+
+    def _lock_lag(self, A: int):
+        self.lag = A
+        self._cand = None
+        self.bypass = False
+        self._reset_filter()
+        self._mute_until = self._cap_n + int(self.FS * self.RECONVERGE_S)
+
+
+# ────────────────────────────────────────────────────────────────
+# Native Windows WASAPI Process Loopback (Tầng 1 & Tầng 2)
+# Vượt qua giới hạn giả Build 20438 của proctap → chạy trên cả
+# Windows 10 (2004 / 21H2 / 22H2 — Build ≥ 19041) và Windows 11.
+# ────────────────────────────────────────────────────────────────
+if sys.platform.startswith("win"):
+    _ole32 = ctypes.windll.ole32
+    _mmdevapi = ctypes.windll.mmdevapi
+    _kernel32 = ctypes.windll.kernel32
+
+    class _GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", wintypes.DWORD),
+            ("Data2", wintypes.WORD),
+            ("Data3", wintypes.WORD),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+        @classmethod
+        def from_str(cls, s: str) -> "_GUID":
+            g = cls()
+            _ole32.IIDFromString(ctypes.c_wchar_p(s), ctypes.byref(g))
+            return g
+
+    def _guid_eq(a: _GUID, b: _GUID) -> bool:
+        return bytes(a) == bytes(b)
+
+    _IID_IUnknown = _GUID.from_str("{00000000-0000-0000-C000-000000000046}")
+    _IID_IAgileObject = _GUID.from_str("{94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}")
+    _IID_IActivateAudioInterfaceCompletionHandler = _GUID.from_str(
+        "{41D949AB-9862-444A-80F6-C261334DA5EB}"
+    )
+    _IID_IAudioClient = _GUID.from_str("{1CB9AD4C-DBFA-4c32-B178-C2F568A703B2}")
+    _IID_IAudioCaptureClient = _GUID.from_str("{C8ADBD64-E71E-48a0-A4DE-185C395CD317}")
+
+    class _AUDIOCLIENT_ACTIVATION_PARAMS(ctypes.Structure):
+        _fields_ = [
+            ("ActivationType", wintypes.DWORD),       # 1 = PROCESS_LOOPBACK
+            ("TargetProcessId", wintypes.DWORD),
+            ("ProcessLoopbackMode", wintypes.DWORD),  # 0 = INCLUDE, 1 = EXCLUDE
+        ]
+
+    class _PROPVARIANT_BLOB(ctypes.Structure):
+        _fields_ = [
+            ("vt", wintypes.USHORT),                  # 65 = VT_BLOB
+            ("wReserved1", wintypes.USHORT),
+            ("wReserved2", wintypes.USHORT),
+            ("wReserved3", wintypes.USHORT),
+            ("cbSize", wintypes.ULONG),
+            ("pBlobData", ctypes.c_void_p),
+            ("_pad", ctypes.c_void_p),
+        ]
+
+    class _WAVEFORMATEX(ctypes.Structure):
+        _fields_ = [
+            ("wFormatTag", wintypes.WORD),
+            ("nChannels", wintypes.WORD),
+            ("nSamplesPerSec", wintypes.DWORD),
+            ("nAvgBytesPerSec", wintypes.DWORD),
+            ("nBlockAlign", wintypes.WORD),
+            ("wBitsPerSample", wintypes.WORD),
+            ("cbSize", wintypes.WORD),
+        ]
+
+    _QI_FUNC = ctypes.WINFUNCTYPE(
+        ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)
+    )
+    _ADDREF_FUNC = ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)
+    _RELEASE_FUNC = ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)
+    _COMPLETED_FUNC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)
+
+    class _HandlerVtbl(ctypes.Structure):
+        _fields_ = [
+            ("QueryInterface", _QI_FUNC),
+            ("AddRef", _ADDREF_FUNC),
+            ("Release", _RELEASE_FUNC),
+            ("ActivateCompleted", _COMPLETED_FUNC),
+        ]
+
+    class _HandlerObj(ctypes.Structure):
+        _fields_ = [("lpVtbl", ctypes.POINTER(_HandlerVtbl))]
+
+    _mmdevapi.ActivateAudioInterfaceAsync.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(_GUID),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    _mmdevapi.ActivateAudioInterfaceAsync.restype = ctypes.c_long
+
+    def _com_vtable(ptr: int):
+        return ctypes.cast(
+            ctypes.cast(ptr, ctypes.POINTER(ctypes.c_void_p))[0],
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+
+    def _com_release(ptr: int | None):
+        if ptr:
+            try:
+                vtbl = _com_vtable(ptr)
+                ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)(vtbl[2])(ptr)
+            except Exception:
+                pass
+
+    def _activate_wasapi_process_loopback(
+        target_pid: int, loopback_mode: int
+    ) -> tuple[int, int, dict]:
+        """Kích hoạt WASAPI Process Loopback cho target_pid:
+          - loopback_mode = 0: INCLUDE_TARGET_PROCESS_TREE (chỉ thu ứng dụng đích)
+          - loopback_mode = 1: EXCLUDE_TARGET_PROCESS_TREE (thu mọi thứ TRỪ target_pid)
+        Trả về (audio_client_ptr, capture_client_ptr, format_dict)."""
+        _ole32.CoInitializeEx(None, 0)
+        event = _kernel32.CreateEventW(None, True, False, None)
+        if not event:
+            raise OSError("CreateEventW failed")
+        act_hr = ctypes.c_long(-1)
+        act_unk = ctypes.c_void_p(0)
+
+        def _py_qi(this, riid, ppv):
+            g = riid.contents
+            if (
+                _guid_eq(g, _IID_IUnknown)
+                or _guid_eq(g, _IID_IActivateAudioInterfaceCompletionHandler)
+                or _guid_eq(g, _IID_IAgileObject)
+            ):
+                ppv[0] = this
+                return 0
+            ppv[0] = 0
+            return -2147467262  # E_NOINTERFACE
+
+        def _py_addref(this):
+            return 2
+
+        def _py_release(this):
+            return 1
+
+        def _py_completed(this, op_ptr):
+            try:
+                vtbl = _com_vtable(op_ptr)
+                get_res = ctypes.WINFUNCTYPE(
+                    ctypes.c_long,
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_long),
+                    ctypes.POINTER(ctypes.c_void_p),
+                )(vtbl[3])
+                get_res(op_ptr, ctypes.byref(act_hr), ctypes.byref(act_unk))
+            finally:
+                _kernel32.SetEvent(event)
+            return 0
+
+        vtbl = _HandlerVtbl(
+            _QI_FUNC(_py_qi),
+            _ADDREF_FUNC(_py_addref),
+            _RELEASE_FUNC(_py_release),
+            _COMPLETED_FUNC(_py_completed),
+        )
+        handler = _HandlerObj(ctypes.pointer(vtbl))
+        params = _AUDIOCLIENT_ACTIVATION_PARAMS(1, int(target_pid), int(loopback_mode))
+        prop = _PROPVARIANT_BLOB(
+            65, 0, 0, 0, ctypes.sizeof(params), ctypes.addressof(params), None
+        )
+        async_op = ctypes.c_void_p(0)
+
+        try:
+            hr = _mmdevapi.ActivateAudioInterfaceAsync(
+                "VAD\\Process_Loopback",
+                ctypes.byref(_IID_IAudioClient),
+                ctypes.byref(prop),
+                ctypes.byref(handler),
+                ctypes.byref(async_op),
+            )
+            if hr < 0:
+                raise RuntimeError(f"ActivateAudioInterfaceAsync failed: 0x{hr & 0xFFFFFFFF:08X}")
+            wait_res = _kernel32.WaitForSingleObject(event, 5000)
+            if wait_res != 0 or act_hr.value < 0 or not act_unk.value:
+                raise RuntimeError(
+                    f"Process loopback activation failed: 0x{act_hr.value & 0xFFFFFFFF:08X}"
+                )
+        finally:
+            _com_release(async_op.value)
+            _kernel32.CloseHandle(event)
+
+        audio_client = ctypes.c_void_p(0)
+        try:
+            unk_vtbl = _com_vtable(act_unk.value)
+            qi_fn = ctypes.WINFUNCTYPE(
+                ctypes.c_long,
+                ctypes.c_void_p,
+                ctypes.POINTER(_GUID),
+                ctypes.POINTER(ctypes.c_void_p),
+            )(unk_vtbl[0])
+            hr_qi = qi_fn(act_unk.value, ctypes.byref(_IID_IAudioClient), ctypes.byref(audio_client))
+            if hr_qi < 0 or not audio_client.value:
+                raise RuntimeError(f"QueryInterface(IAudioClient) failed: 0x{hr_qi & 0xFFFFFFFF:08X}")
+        finally:
+            _com_release(act_unk.value)
+
+        ac_vtbl = _com_vtable(audio_client.value)
+        init_fn = ctypes.WINFUNCTYPE(
+            ctypes.c_long,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            wintypes.DWORD,
+            ctypes.c_longlong,
+            ctypes.c_longlong,
+            ctypes.POINTER(_WAVEFORMATEX),
+            ctypes.c_void_p,
+        )(ac_vtbl[3])
+
+        # LOOPBACK (0x00020000) | AUTOCONVERTPCM (0x80000000) | SRC_DEFAULT_QUALITY (0x08000000)
+        stream_flags = 0x00020000 | 0x80000000 | 0x08000000
+        # Ưu tiên 48kHz, 2 kênh, float32; fallback 44.1kHz, 2 kênh, int16
+        wfx = _WAVEFORMATEX(3, 2, CAPTURE_RATE, CAPTURE_RATE * 8, 8, 32, 0)
+        hr_init = init_fn(
+            audio_client.value, 0, stream_flags, 2_000_000, 0, ctypes.byref(wfx), None
+        )
+        if hr_init < 0:
+            wfx = _WAVEFORMATEX(1, 2, 44100, 44100 * 4, 4, 16, 0)
+            hr_init = init_fn(
+                audio_client.value, 0, stream_flags, 2_000_000, 0, ctypes.byref(wfx), None
+            )
+            if hr_init < 0:
+                _com_release(audio_client.value)
+                raise RuntimeError(f"IAudioClient.Initialize failed: 0x{hr_init & 0xFFFFFFFF:08X}")
+
+        get_service = ctypes.WINFUNCTYPE(
+            ctypes.c_long,
+            ctypes.c_void_p,
+            ctypes.POINTER(_GUID),
+            ctypes.POINTER(ctypes.c_void_p),
+        )(ac_vtbl[14])
+        cap_client = ctypes.c_void_p(0)
+        hr_svc = get_service(
+            audio_client.value, ctypes.byref(_IID_IAudioCaptureClient), ctypes.byref(cap_client)
+        )
+        if hr_svc < 0 or not cap_client.value:
+            _com_release(audio_client.value)
+            raise RuntimeError(f"GetService(IAudioCaptureClient) failed: 0x{hr_svc & 0xFFFFFFFF:08X}")
+
+        fmt = {
+            "sample_rate": int(wfx.nSamplesPerSec),
+            "channels": int(wfx.nChannels),
+            "bits_per_sample": int(wfx.wBitsPerSample),
+            "block_align": int(wfx.nBlockAlign),
+        }
+        return int(audio_client.value), int(cap_client.value), fmt
+
+
+class WinProcessAudioCapture:
+    """Bộ thu âm thanh 3 tầng chống lặp loa cho mọi phiên bản Windows:
+      1. process_include (Win 10 2004+ Build ≥ 19041 & Win 11):
+         Thu riêng cây tiến trình nguồn (INCLUDE_TARGET_PROCESS_TREE).
+      2. process_exclude_self (Fallback cấp OS Mixer):
+         Thu âm hệ thống nhưng loại trừ cây tiến trình của chính AudioTranslator
+         (EXCLUDE_TARGET_PROCESS_TREE) → 0% tiếng dịch lọt vào luồng thu.
+      3. system_loopback (Windows đời cũ < Build 19041):
+         Fallback sang proctap toàn hệ thống + bật EchoCanceller có NLP."""
+
+    def __init__(self, pid: int, on_data=None, prefer_mode: str = "auto"):
+        self.raw_pid = pid
+        self.root_pid = _root_process_pid(pid) if pid and pid > 0 else pid
+        self._on_data = on_data
+        self._prefer_mode = prefer_mode
+        self._audio_client: int | None = None
+        self._cap_client: int | None = None
+        self._fallback_tap = None
+        self._thread: threading.Thread | None = None
+        self._running = threading.Event()
+        self.mode = "system_loopback"
+        self.is_process_specific = False
+        self.format: dict = {
+            "sample_rate": CAPTURE_RATE,
+            "channels": CAPTURE_CHANNELS,
+            "bits_per_sample": 32,
+            "block_align": 8,
+        }
+        self.last_error: str | None = None
+        self._active_target_pid: int = self.root_pid
+        self._active_loopback_mode: int = 0
+        self._init_capture()
+
+    def _init_capture(self):
+        errors: list[str] = []
+        if sys.platform.startswith("win"):
+            # Tầng 1: INCLUDE_TARGET_PROCESS_TREE trên root_pid (và raw_pid nếu khác)
+            if self._prefer_mode in ("auto", "include") and self.root_pid and self.root_pid > 0:
+                candidates = [self.root_pid]
+                if self.raw_pid != self.root_pid and self.raw_pid > 0:
+                    candidates.append(self.raw_pid)
+                for cand_pid in candidates:
+                    try:
+                        ac, cc, fmt = _activate_wasapi_process_loopback(cand_pid, 0)
+                        self._audio_client, self._cap_client, self.format = ac, cc, fmt
+                        self._active_target_pid = cand_pid
+                        self._active_loopback_mode = 0
+                        self.mode = "process_include"
+                        self.is_process_specific = True
+                        self.last_error = None
+                        return
+                    except Exception as e:
+                        errors.append(f"include(pid={cand_pid}): {e}")
+
+            # Tầng 2: EXCLUDE_TARGET_PROCESS_TREE trên chính tiến trình AudioTranslator
+            if self._prefer_mode in ("auto", "exclude_self"):
+                own_candidates = [_own_root_pid()]
+                if os.getpid() not in own_candidates:
+                    own_candidates.append(os.getpid())
+                for own_pid in own_candidates:
+                    try:
+                        ac, cc, fmt = _activate_wasapi_process_loopback(own_pid, 1)
+                        self._audio_client, self._cap_client, self.format = ac, cc, fmt
+                        self._active_target_pid = own_pid
+                        self._active_loopback_mode = 1
+                        self.mode = "process_exclude_self"
+                        self.is_process_specific = True
+                        self.last_error = "; ".join(errors) if errors else None
+                        return
+                    except Exception as e:
+                        errors.append(f"exclude_self(pid={own_pid}): {e}")
+
+        # Tầng 3: Fallback về proctap (cho Windows < Build 19041)
+        from proctap import ProcessAudioCapture
+        self._fallback_tap = ProcessAudioCapture(self.raw_pid, on_data=self._on_data)
+        ps, fmt, err = _inspect_tap(self._fallback_tap)
+        self.is_process_specific = ps
+        self.mode = "process_include" if ps else "system_loopback"
+        if fmt:
+            self.format = fmt
+        if err:
+            errors.append(err)
+        self.last_error = "; ".join(errors) if errors else None
+
+    def start(self):
+        if self._fallback_tap is not None:
+            self._fallback_tap.start()
+            return
+        if not self._audio_client:
+            raise RuntimeError("WASAPI audio client not initialized")
+        ac_vtbl = _com_vtable(self._audio_client)
+        start_fn = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(ac_vtbl[10])
+        hr = start_fn(self._audio_client)
+        if hr < 0:
+            raise RuntimeError(f"IAudioClient.Start failed: 0x{hr & 0xFFFFFFFF:08X}")
+        self._running.set()
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+
+    def _reopen_native(self) -> bool:
+        """Tự động mở lại stream khi người dùng đổi thiết bị loa mặc định (0x88890004)."""
+        self._release_native()
+        try:
+            ac, cc, fmt = _activate_wasapi_process_loopback(
+                self._active_target_pid, self._active_loopback_mode
+            )
+            self._audio_client, self._cap_client, self.format = ac, cc, fmt
+            ac_vtbl = _com_vtable(self._audio_client)
+            start_fn = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(ac_vtbl[10])
+            return start_fn(self._audio_client) >= 0
+        except Exception:
+            return False
+
+    def _capture_loop(self):
+        _ole32.CoInitializeEx(None, 0)
+        try:
+            while self._running.is_set():
+                cc = self._cap_client
+                if not cc:
+                    break
+                cc_vtbl = _com_vtable(cc)
+                get_next = ctypes.WINFUNCTYPE(
+                    ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(wintypes.UINT)
+                )(cc_vtbl[5])
+                get_buf = ctypes.WINFUNCTYPE(
+                    ctypes.c_long,
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_void_p),
+                    ctypes.POINTER(wintypes.UINT),
+                    ctypes.POINTER(wintypes.DWORD),
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                )(cc_vtbl[3])
+                rel_buf = ctypes.WINFUNCTYPE(
+                    ctypes.c_long, ctypes.c_void_p, wintypes.UINT
+                )(cc_vtbl[4])
+
+                pkt = wintypes.UINT(0)
+                hr = get_next(cc, ctypes.byref(pkt))
+                if (hr & 0xFFFFFFFF) == 0x88890004:  # AUDCLNT_E_DEVICE_INVALIDATED
+                    if not self._reopen_native():
+                        time.sleep(0.2)
+                    continue
+                if hr < 0 or pkt.value == 0:
+                    time.sleep(0.005)
+                    continue
+
+                while self._running.is_set() and pkt.value > 0:
+                    data_ptr = ctypes.c_void_p(0)
+                    nframes = wintypes.UINT(0)
+                    flags = wintypes.DWORD(0)
+                    hr_b = get_buf(
+                        cc,
+                        ctypes.byref(data_ptr),
+                        ctypes.byref(nframes),
+                        ctypes.byref(flags),
+                        None,
+                        None,
+                    )
+                    if hr_b < 0:
+                        break
+                    nf = int(nframes.value)
+                    pcm_bytes = b""
+                    if nf > 0:
+                        ch = int(self.format.get("channels", 2))
+                        bits = int(self.format.get("bits_per_sample", 32))
+                        block_align = int(self.format.get("block_align", ch * (bits // 8)))
+                        if (flags.value & 0x2) or not data_ptr.value:  # AUDCLNT_BUFFERFLAGS_SILENT
+                            pcm_bytes = bytes(nf * ch * 4)
+                        elif bits == 32:
+                            pcm_bytes = ctypes.string_at(data_ptr.value, nf * block_align)
+                        else:
+                            raw = ctypes.string_at(data_ptr.value, nf * block_align)
+                            arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                            pcm_bytes = arr.tobytes()
+                    rel_buf(cc, nframes.value)
+                    if pcm_bytes and self._on_data is not None:
+                        try:
+                            self._on_data(pcm_bytes, nf)
+                        except Exception:
+                            pass
+                    if get_next(cc, ctypes.byref(pkt)) < 0:
+                        break
+        finally:
+            try:
+                _ole32.CoUninitialize()
+            except Exception:
+                pass
+
+    def _release_native(self):
+        if self._audio_client:
+            try:
+                ac_vtbl = _com_vtable(self._audio_client)
+                ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(ac_vtbl[11])(self._audio_client)
+            except Exception:
+                pass
+        _com_release(self._cap_client)
+        _com_release(self._audio_client)
+        self._cap_client = None
+        self._audio_client = None
+
+    def close(self):
+        self._running.clear()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.5)
+        self._thread = None
+        if self._fallback_tap is not None:
+            try:
+                self._fallback_tap.close()
+            except Exception:
+                pass
+            self._fallback_tap = None
+        self._release_native()
+
+
+def _inspect_tap(tap) -> tuple[bool, dict | None, str | None]:
+    """(is_process_specific, native_format, last_error) của bộ thu âm."""
+    if isinstance(tap, WinProcessAudioCapture):
+        return tap.is_process_specific, tap.format, tap.last_error
+    native = getattr(getattr(tap, "_backend", None), "_native", None)
+    if native is None:
+        return True, None, None
+    try:
+        ps = bool(native.is_process_specific())
+    except Exception:
+        ps = True
+    try:
+        fmt = native.get_format()
+    except Exception:
+        fmt = None
+    try:
+        err = native.get_last_error()
+    except Exception:
+        err = None
+    return ps, fmt, err
+
+
 # ────────────────────────────────────────────────────────────────
 # Translator engine
 # ────────────────────────────────────────────────────────────────
@@ -309,11 +1306,14 @@ class Translator:
         model: str = MODEL,
         stop_event: threading.Event | None = None,
         msg_queue: thread_queue.Queue | None = None,
+        output_device: int | None = None,
     ):
         self.pid = pid
+        self.root_pid = _root_process_pid(pid)
         self.target_lang = target_lang
         self.original_vol = original_vol
         self.model = model
+        self.output_device = output_device   # None = loa mặc định của Windows
         self._stop = stop_event or threading.Event()
         self._msg_q = msg_queue
 
@@ -324,13 +1324,21 @@ class Translator:
         self._pa = None
         self._loop = None
         self._vol_ctl = AppVolumeController(pid)
+        # Capture pipeline (thiết lập lại mỗi phiên trong start_capture)
+        self._aec: EchoCanceller | None = None
+        self._cap_rs: StreamResampler | None = None
+        self._cap_rate = CAPTURE_RATE
+        self._cap_channels: int | None = None
+        self._capture_ready: asyncio.Event | None = None
+        self._warned_fallback = False
+        self._process_specific = True
 
     def _emit(self, kind: str, text: str):
         if self._msg_q:
             self._msg_q.put((kind, text))
         else:
             tag = {"ok": "[✓]", "error": "[LỖI]", "status": "[→]",
-                   "transcript": "[Dịch]"}.get(kind, "[i]")
+                   "transcript": "[Dịch]", "warn": "[!]"}.get(kind, "[i]")
             print(f"{tag} {text}")
 
     def set_original_volume(self, level: float):
@@ -351,14 +1359,16 @@ class Translator:
         except asyncio.QueueEmpty:
             pass
 
-    # ── ProcTap callback (chỉ dùng để GỬI đi dịch, KHÔNG phát lại) ──
+    # ── Capture callback (chỉ dùng để GỬI đi dịch, KHÔNG phát lại) ──
     def _on_capture(self, pcm_bytes: bytes, frames: int):
-        if self._loop is None:
+        if self._loop is None or self._cap_rs is None:
             return
         samples = np.frombuffer(pcm_bytes, dtype=np.float32)
         if len(samples) == 0:
             return
-        if frames and frames > 0 and len(samples) % frames == 0:
+        if self._cap_channels:
+            channels = self._cap_channels
+        elif frames and frames > 0 and len(samples) % frames == 0:
             channels = len(samples) // frames
         else:
             channels = CAPTURE_CHANNELS
@@ -370,26 +1380,80 @@ class Translator:
         samples = samples[:usable]
         mono = samples if channels == 1 else samples.reshape(-1, channels).mean(axis=1)
 
-        mono16k = resample_mono(mono, CAPTURE_RATE, SEND_SAMPLE_RATE)
+        mono16k = self._cap_rs.process(mono)
+        aec = self._aec
+        if aec is not None:
+            mono16k = aec.process(mono16k, time.monotonic())
+        if len(mono16k) == 0:
+            return
         pcm16 = (np.clip(mono16k, -1, 1) * 32767).astype(np.int16).tobytes()
         self._loop.call_soon_threadsafe(self._enqueue_upload, pcm16)
 
-    async def start_capture(self):
-        from proctap import ProcessAudioCapture
+    def _setup_capture_mode(self, tap):
+        """Thiết lập bộ chuyển tần số mẫu và kiểm tra chế độ chống lặp loa."""
+        process_specific, fmt, err = _inspect_tap(tap)
 
+        self._cap_rate, self._cap_channels = CAPTURE_RATE, None
+        if isinstance(tap, WinProcessAudioCapture) and tap._fallback_tap is None:
+            self._cap_rate = int((fmt or {}).get("sample_rate") or CAPTURE_RATE)
+            self._cap_channels = int((fmt or {}).get("channels") or CAPTURE_CHANNELS)
+        elif fmt and int(fmt.get("bits_per_sample", 0)) == 32:
+            fb = getattr(tap, "_fallback_tap", tap)
+            backend = getattr(fb, "_backend", None)
+            if backend is not None and getattr(backend, "_converter", None) is not None:
+                backend._converter = None
+            self._cap_rate = int(fmt.get("sample_rate") or CAPTURE_RATE)
+            self._cap_channels = int(fmt.get("channels") or CAPTURE_CHANNELS)
+        self._cap_rs = StreamResampler(self._cap_rate, SEND_SAMPLE_RATE)
+
+        self._aec = None
+        self._process_specific = process_specific
+        mode = getattr(tap, "mode", "process_include" if process_specific else "system_loopback")
+        if process_specific:
+            if not self._warned_fallback and mode == "process_exclude_self":
+                self._warned_fallback = True
+                self._emit(
+                    "info",
+                    "→ Đang thu âm chế độ loại trừ tiến trình AudioTranslator ở cấp Windows Mixer "
+                    "(không thu lại giọng dịch).",
+                )
+            return
+        same_device = is_default_output(self.output_device)
+        if same_device:
+            self._aec = EchoCanceller(on_event=lambda t: self._emit("info", t))
+        if self._warned_fallback:
+            return
+        self._warned_fallback = True
+        self._emit("warn", "⚠ Phiên bản Windows này quá cũ (trước Windows 10 2004 / Build 19041) "
+                           "→ đang thu âm toàn hệ thống kèm bộ khử vọng + NLP.")
+        if err:
+            self._emit("info", f"   Chi tiết: {err}")
+        if same_device:
+            self._emit("warn", "→ Đã bật khử vọng số + cổng triệt phần dư phi tuyến (NLP) "
+                               "để chặn lặp giọng dịch.")
+            self._emit("info", "   Mẹo: chọn “Loa phát giọng dịch” là tai nghe/thiết bị khác "
+                               "để tách hoàn toàn phần cứng.")
+        else:
+            self._emit("info", "→ Giọng dịch phát ra thiết bị khác loa mặc định → không bị vọng.")
+
+    async def start_capture(self):
         self._loop = asyncio.get_running_loop()
         # Đặt âm lượng app nguồn theo thanh trượt ngay khi bắt đầu
         self._vol_ctl.set_volume(self.original_vol)
         try:
-            tap = ProcessAudioCapture(self.pid, on_data=self._on_capture)
+            tap = WinProcessAudioCapture(self.pid, on_data=self._on_capture)
+            self._setup_capture_mode(tap)   # TRƯỚC start() → callback đã có AEC nếu cần
             tap.start()
         except Exception as e:
             self._emit("error", f"Không capture được ứng dụng: {e}")
             return
+        finally:
+            if self._capture_ready is not None:
+                self._capture_ready.set()
         self._emit("ok", "Đang lắng nghe ứng dụng…")
         try:
             while not self._stop.is_set():
-                if not psutil.pid_exists(self.pid):
+                if not psutil.pid_exists(self.pid) and not psutil.pid_exists(self.root_pid):
                     self._emit("error", "Ứng dụng đã đóng.")
                     self._stop.set()
                     break
@@ -445,16 +1509,56 @@ class Translator:
                 self._emit("error", f"Nhận audio: {e}")
                 raise  # → reconnect
 
+    def _open_output(self):
+        kw = dict(format=pyaudio.paInt16, channels=1, rate=PLAYBACK_RATE,
+                  output=True, frames_per_buffer=OUTPUT_FRAME)
+        if self.output_device is not None:
+            try:
+                return self._pa.open(output_device_index=self.output_device, **kw)
+            except Exception as e:
+                self._emit("error", f"Không mở được loa đã chọn ({e}) → dùng loa mặc định.")
+                self.output_device = None
+                if not self._process_specific and self._aec is None:
+                    self._aec = EchoCanceller(on_event=lambda t: self._emit("info", t))
+                    self._emit("warn", "→ Đã bật khử vọng vì giọng dịch phát ra loa đang bị ghi.")
+        return self._pa.open(**kw)
+
     async def play_output(self):
-        """CHỈ phát âm thanh đã dịch → không còn vọng do phát lại âm gốc."""
+        """CHỈ phát âm thanh đã dịch → không còn vọng do phát lại âm gốc.
+        Chế độ khử vọng: phát LIÊN TỤC (im lặng khi không có dữ liệu) để dòng tham
+        chiếu khớp đúng nhịp với loa, và đẩy mọi mẫu đã phát vào EchoCanceller."""
+        if self._capture_ready is not None:
+            try:
+                await asyncio.wait_for(self._capture_ready.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                pass
         self._pa = pyaudio.PyAudio()
-        self.out_stream = self._pa.open(
-            format=pyaudio.paInt16, channels=1, rate=PLAYBACK_RATE,
-            output=True, frames_per_buffer=OUTPUT_FRAME,
-        )
+        self.out_stream = self._open_output()
+        aec = self._aec
+        ref_rs = RefResampler(PLAYBACK_RATE, self._cap_rate, SEND_SAMPLE_RATE) if aec else None
+        try:
+            buf_cap = int(self.out_stream.get_write_available())
+        except Exception:
+            buf_cap = 0
         leftover = np.array([], dtype=np.float32)
         loop = asyncio.get_running_loop()
         last_data_time = loop.time()
+
+        async def _write(frame: np.ndarray):
+            frame = np.clip(frame, -1.0, 1.0)
+            if aec is not None:
+                aec.push_ref(ref_rs.process(frame), time.monotonic())
+            out = (frame * 32767).astype(np.int16).tobytes()
+            await asyncio.to_thread(self.out_stream.write, out)
+
+        def _buffer_low() -> bool:
+            if buf_cap <= 2 * OUTPUT_FRAME:
+                return True
+            try:
+                queued = buf_cap - int(self.out_stream.get_write_available())
+            except Exception:
+                return True
+            return queued < 2 * OUTPUT_FRAME
 
         try:
             while not self._stop.is_set():
@@ -473,17 +1577,18 @@ class Translator:
                 time_since = loop.time() - last_data_time
                 should_flush = len(leftover) > 0 and time_since > 0.1
 
-                if len(leftover) >= OUTPUT_FRAME or should_flush:
-                    if len(leftover) >= OUTPUT_FRAME:
-                        frame = leftover[:OUTPUT_FRAME]
-                        leftover = leftover[OUTPUT_FRAME:]
-                    else:
-                        frame = np.zeros(OUTPUT_FRAME, dtype=np.float32)
-                        frame[:len(leftover)] = leftover
-                        leftover = np.array([], dtype=np.float32)
-                    out = (np.clip(frame, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-                    await asyncio.to_thread(self.out_stream.write, out)
+                if len(leftover) >= OUTPUT_FRAME:
+                    await _write(leftover[:OUTPUT_FRAME])
+                    leftover = leftover[OUTPUT_FRAME:]
                     last_data_time = loop.time()
+                elif should_flush or (aec is not None and _buffer_low()):
+                    # flush phần dư / hoặc (chế độ khử vọng) bơm im lặng trước khi loa cạn
+                    frame = np.zeros(OUTPUT_FRAME, dtype=np.float32)
+                    frame[:len(leftover)] = leftover
+                    leftover = np.array([], dtype=np.float32)
+                    await _write(frame)
+                    if should_flush:
+                        last_data_time = loop.time()
                 else:
                     await asyncio.sleep(0.005)
         finally:
@@ -513,6 +1618,8 @@ class Translator:
                     retry = 0  # reset on successful connect
                     self._emit("ok", "Đã kết nối. Đang dịch…")
                     _user_stopped = False
+                    self._capture_ready = asyncio.Event()
+                    self._aec = None
                     try:
                         async with asyncio.TaskGroup() as tg:
                             tg.create_task(self.start_capture())
@@ -602,9 +1709,9 @@ class TranslatorGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Audio Translator")
-        self.root.geometry("440x600")
+        self.root.geometry("440x660")
         self.root.configure(bg=self.BG)
-        self.root.minsize(400, 540)
+        self.root.minsize(400, 600)
         # ponytail: set window icon — look next to exe/script
         _icon_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "icon.ico")
         if not os.path.exists(_icon_path):
@@ -620,6 +1727,7 @@ class TranslatorGUI:
         self._stop_event = threading.Event()
         self._msg_q: thread_queue.Queue = thread_queue.Queue()
         self._sources: list[tuple[int, str, bool]] = []
+        self._outputs: list[tuple[int | None, str]] = []
 
         self._build_ui()
         self._refresh_sources()
@@ -747,6 +1855,22 @@ class TranslatorGUI:
             self.lang_combo.current(0)
         self.lang_combo.pack(fill="x", padx=24, pady=(4, 14))
 
+        # ── Loa phát giọng dịch ──
+        out_head = tk.Frame(self.root, bg=self.BG)
+        out_head.pack(fill="x", **pad)
+        ttk.Label(out_head, text="LOA PHÁT GIỌNG DỊCH", style="Field.TLabel").pack(side="left")
+        out_help = tk.Label(out_head, text="?", bg=self.BG, fg=self.MUTED,
+                            font=("Segoe UI", 9, "bold"), cursor="question_arrow")
+        out_help.pack(side="left", padx=(6, 0))
+        ToolTip(out_help,
+                "Trên Windows 10 (2004+) và Windows 11, app tự động tách riêng âm thanh "
+                "của ứng dụng nguồn ở tầng Windows Mixer (không bị lặp loa).\n"
+                "Tùy chọn này giúp bạn phát giọng dịch ra tai nghe/loa phụ hoặc dùng cho "
+                "các bản Windows đời cũ trước 2020.",
+                self.CARD, self.TEXT, self.BORDER)
+        self.out_combo = ttk.Combobox(self.root, state="readonly")
+        self.out_combo.pack(fill="x", padx=24, pady=(4, 14))
+
         # ── Âm lượng gốc ──
         vol_head = tk.Frame(self.root, bg=self.BG)
         vol_head.pack(fill="x", padx=24)
@@ -799,6 +1923,7 @@ class TranslatorGUI:
         self.log_text.tag_configure("status", foreground=self.ACCENT)
         self.log_text.tag_configure("transcript", foreground=self.YELLOW)
         self.log_text.tag_configure("info", foreground=self.MUTED)
+        self.log_text.tag_configure("warn", foreground="#ffa94d")
         self.log_text.configure(state="disabled")
 
         self._log("Chọn ứng dụng đang phát rồi nhấn Bắt đầu.", "info")
@@ -875,6 +2000,7 @@ class TranslatorGUI:
         self.log_text.configure(state="disabled")
 
     def _refresh_sources(self):
+        self._refresh_outputs()
         self._sources = list_audio_sources()
         labels = []
         for _, app, playing in self._sources:
@@ -886,11 +2012,25 @@ class TranslatorGUI:
         else:
             self._log("Không thấy ứng dụng nào có âm thanh. Hãy mở và phát thử.", "info")
 
+    def _refresh_outputs(self):
+        cur = self.out_combo.get() if self._outputs else _load_config().get("output_device", "")
+        self._outputs = [(None, "Mặc định của Windows")] + list_output_devices()
+        names = [n for _, n in self._outputs]
+        self.out_combo["values"] = names
+        self.out_combo.current(names.index(cur) if cur in names else 0)
+
+    def _selected_output(self) -> int | None:
+        i = self.out_combo.current()
+        if 0 <= i < len(self._outputs):
+            return self._outputs[i][0]
+        return None
+
     def _set_fields_state(self, state: str):
         ro = "readonly" if state == "normal" else "disabled"
         self.api_entry.configure(state=state)
         self.lang_combo.configure(state=ro)
         self.source_combo.configure(state=ro)
+        self.out_combo.configure(state=ro)
         # KHÔNG khoá thanh âm lượng — cho phép chỉnh trong lúc dịch
 
     def _toggle(self):
@@ -912,6 +2052,13 @@ class TranslatorGUI:
         pid = self._sources[idx][0]
         lang = self._lang_codes[max(self.lang_combo.current(), 0)]
         vol = self.vol_var.get() / 100.0
+        out_dev = self._selected_output()
+        try:
+            cfg = _load_config()
+            cfg["output_device"] = "" if out_dev is None else self.out_combo.get()
+            _save_config(cfg)
+        except Exception:
+            pass
 
         init_client(api_key)
         self._stop_event.clear()
@@ -919,6 +2066,7 @@ class TranslatorGUI:
         self._translator = Translator(
             pid, target_lang=lang, original_vol=vol,
             stop_event=self._stop_event, msg_queue=self._msg_q,
+            output_device=out_dev,
         )
 
         def _run():
